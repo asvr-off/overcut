@@ -51,14 +51,7 @@ All available from Google Fonts / JetBrains.
 ### Default shortcuts
 Ships pre-loaded with Jupyter Notebook shortcuts as a reference set. Replace or extend via the manager window.
 
-### Project structure
-OverCut/
-|--overcut.py          # Full application source
-|--overcut.ico         # Tray + exe icon
-|--fonts/              # Bundled TTF fonts
-└--overcut_data.json   # Auto-generated on first run (user data)
-
-Known limitations
+### Known limitations
 
 Windows only — uses ctypes for UAC elevation and keyboard lib is Windows-focused
 Requires admin rights for global hotkey capture
