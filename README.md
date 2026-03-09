@@ -47,10 +47,13 @@ _Must be run as Administrator on Windows — the keyboard library requires eleva
 Drop TTF/OTF files into a fonts/ folder next to the script or exe. The loader registers them automatically at startup and prints the resolved family names to console.
 Bundled fonts used in this project:
 
-Inter — primary UI font
-JetBrains Mono — key badges, hotkey field
-Roboto Condensed — section labels
-Zalando Sans Expanded — display title
+Inter - primary UI font
+
+JetBrains Mono - key badges, hotkey field
+
+Roboto Condensed - section labels
+
+Zalando Sans Expanded - display title
 
 _All available from Google Fonts / JetBrains._
 
