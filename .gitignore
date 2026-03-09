@@ -1,1 +1,10 @@
+<<<<<<< HEAD
  
+=======
+build/
+dist/
+__pycache__/
+*.spec
+*.pyc
+overcut_data.json
+>>>>>>> 1fc5bbe6dcd8018c51f28dcd353a4329508bd928
