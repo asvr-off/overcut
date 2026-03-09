@@ -33,7 +33,7 @@ Fonts: Inter, JetBrains Mono, Roboto Condensed, Zalando Sans Expanded (Google Fo
 ### Requirements
 **For Windows Users:**
 
-Grab the exe file from the Releases
+Grab the exe file from the [Releases](https://github.com/asvr-off/overcut/releases)
 
 **For Python Build Users:**
 
