@@ -20,9 +20,13 @@ Persistent data — saves to overcut_data.json next to the exe
 
 ## Stack
 Language: Python 3.13
+
 UI: PyQt6
+
 PyLib: keyboard
+
 Packaging: PyInstaller
+
 Fonts: Inter, JetBrains Mono, Roboto Condensed, Zalando Sans Expanded (Google Fonts)
 
 ## Getting started
@@ -67,4 +71,4 @@ Windows only — uses ctypes for UAC elevation and keyboard lib is Windows-focus
 Requires admin rights for global hotkey capture
 No import/export for shortcut data yet
 
-_This readme.md was partially AI generated_
+_This readme.md and the code structure was partially AI generated_
