@@ -1,0 +1,75 @@
+{
+  "trigger_key": "ctrl+shift+~",
+  "categories": {
+    "Jupyter Notebook": [
+      {
+        "key": "Shift+Enter",
+        "action": "Run cell \u2014 move to next"
+      },
+      {
+        "key": "Ctrl+Enter",
+        "action": "Run cell \u2014 stay"
+      },
+      {
+        "key": "Alt+Enter",
+        "action": "Run cell \u2014 insert below"
+      },
+      {
+        "key": "Esc",
+        "action": "Enter Command mode"
+      },
+      {
+        "key": "Enter",
+        "action": "Enter Edit mode"
+      },
+      {
+        "key": "A",
+        "action": "[CMD] Insert cell Above"
+      },
+      {
+        "key": "B",
+        "action": "[CMD] Insert cell Below"
+      },
+      {
+        "key": "D D",
+        "action": "[CMD] Delete cell"
+      },
+      {
+        "key": "Z",
+        "action": "[CMD] Undo cell deletion"
+      },
+      {
+        "key": "M",
+        "action": "[CMD] Convert to Markdown"
+      },
+      {
+        "key": "Y",
+        "action": "[CMD] Convert to Code"
+      },
+      {
+        "key": "Shift+M",
+        "action": "[CMD] Merge selected cells"
+      },
+      {
+        "key": "Tab",
+        "action": "[EDIT] Autocomplete"
+      },
+      {
+        "key": "Shift+Tab",
+        "action": "[EDIT] Show docstring"
+      },
+      {
+        "key": "Ctrl+/",
+        "action": "[EDIT] Toggle comment"
+      },
+      {
+        "key": "Ctrl+Shift+-",
+        "action": "[EDIT] Split cell at cursor"
+      },
+      {
+        "key": "Ctrl+S",
+        "action": "Save notebook"
+      }
+    ]
+  }
+}
