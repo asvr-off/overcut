@@ -1,46 +1,48 @@
 """
-OverCut — Shortcut Overlay Manager  (PyQt6)
-============================================
+OverCut: Shortcut Overlay Manager (PyQt6)
+=========================================
 Press your hotkey from anywhere to summon the overlay.
 Manage shortcuts by category in the manager window.
-Minimises to system tray.
+Minimises to the system tray.
 
 Requirements:
     pip install PyQt6 keyboard
 Windows:
     Run as Administrator for global hotkey support.
 
-Font setup:
-    Drop TTF files into a fonts/ folder next to this script (or next to the exe).
-    Recommended:
-        Inter-Regular.ttf  +  Inter-Bold.ttf
-            https://fonts.google.com/specimen/Inter
-        JetBrainsMono-Regular.ttf
-            https://www.jetbrains.com/lp/mono/
-    PyInstaller: --add-data "fonts;fonts"  (already in your build command)
+Design system (see the "Design tokens" section):
+    - Type scale in integer pixels: 12 (caption), 13 (body), 16 (title)
+    - Two weights only: Normal and DemiBold
+    - Spacing scale: 4 / 8 / 12 / 16 / 24
+    - Radii: 4 (controls), 6 (panels), 8 (overlay)
+    - One accent colour, one border colour, three text levels
+    - No font properties in the stylesheet: fonts are set in code so Qt's
+      normal text pipeline (and hinting preference) is never overridden
 
-    After launching, check the console for lines like:
-        [Fonts] OK  Inter-Regular.ttf  ->  ['Inter']
-    Use EXACTLY that family name string in QFont / QSS.
+Fonts:
+    The UI uses Segoe UI Variable / Segoe UI when present. Bundled fonts in a
+    fonts/ folder next to this script (or exe) are still registered and are
+    used as a fallback (Inter, JetBrains Mono).
+    PyInstaller: --add-data "fonts;fonts"
 """
 
-import sys, json, os
+import sys, json, os, re, html
+from string import Template
+
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QDialog,
-    QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QLineEdit, QListWidget,
-    QTreeWidget, QTreeWidgetItem, QScrollArea, QFrame,
-    QSystemTrayIcon, QMenu, QMessageBox,
-    QGraphicsDropShadowEffect,
+    QVBoxLayout, QHBoxLayout, QStackedLayout,
+    QLabel, QPushButton, QLineEdit, QListWidget, QListWidgetItem,
+    QTreeWidget, QTreeWidgetItem, QAbstractItemView, QScrollArea, QFrame,
+    QSystemTrayIcon, QMenu, QStackedWidget, QAbstractButton, QTextEdit,
+    QSizePolicy,
 )
 from PyQt6.QtCore import (
-    Qt, QThread, pyqtSignal, QPropertyAnimation,
-    QEasingCurve, QRect, QTimer,
+    Qt, QThread, pyqtSignal, QRectF, QPointF, QSize, QTimer, QEvent,
 )
 from PyQt6.QtGui import (
-    QFont, QFontDatabase, QColor,
+    QFont, QFontDatabase, QFontMetrics, QColor, QPalette,
     QIcon, QPixmap, QPainter, QPen, QBrush,
-    QCursor, QLinearGradient,
 )
 
 try:
@@ -50,6 +52,41 @@ except ImportError:
     HOTKEY_OK = False
 
 import ctypes
+import winreg
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Windows startup registry helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+_STARTUP_KEY  = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_APP_REG_NAME = "OverCut"
+
+def _get_startup_enabled() -> bool:
+    try:
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, _STARTUP_KEY, 0, winreg.KEY_READ)
+        winreg.QueryValueEx(key, _APP_REG_NAME)
+        winreg.CloseKey(key)
+        return True
+    except (FileNotFoundError, OSError):
+        return False
+
+def _set_startup(enabled: bool) -> None:
+    try:
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, _STARTUP_KEY, 0, winreg.KEY_SET_VALUE)
+        if enabled:
+            exe = sys.executable
+            winreg.SetValueEx(key, _APP_REG_NAME, 0, winreg.REG_SZ, f'"{exe}"')
+        else:
+            try:
+                winreg.DeleteValue(key, _APP_REG_NAME)
+            except FileNotFoundError:
+                pass
+        winreg.CloseKey(key)
+    except OSError as e:
+        print(f"[Startup] Registry error: {e}")
+
 
 def _ensure_admin():
     try:
@@ -63,28 +100,89 @@ def _ensure_admin():
 _ensure_admin()
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Spacing scale
+#  Design tokens
 # ─────────────────────────────────────────────────────────────────────────────
 
-SP  = 8
-SP2 = 16
-SP3 = 24
+# Spacing scale
+S1, S2, S3, S4, S5 = 4, 8, 12, 16, 24
+
+# Control height and radii
+CONTROL_H      = 32
+RADIUS_CONTROL = 4
+RADIUS_PANEL   = 6
+RADIUS_MAX     = 8
+
+# Type scale (integer pixels, DPI scaling is handled by Qt)
+FS_CAPTION = 12
+FS_BODY    = 13
+FS_TITLE   = 16
+
+# Palette. One accent, one background, one surface, one border.
+# text / text2 / text3 are the three emphasis levels.
+_THEMES = {
+    "dark": {
+        "bg":            "#151517",
+        "surface":       "#1d1d20",
+        "hover":         "#27272b",
+        "border":        "#313136",
+        "scrollbar":     "#3c3c42",
+        "text":          "#ececef",
+        "text2":         "#b4b4bc",
+        "text3":         "#8a8a93",
+        "accent":        "#3b72e0",
+        "accent_hover":  "#4a80ec",
+        "accent_pressed":"#2f5fc4",
+        "accent_fg":     "#7aa2ff",
+        "accent_subtle": "#1f2b46",
+        "on_accent":     "#ffffff",
+        "danger":        "#f0625d",
+    },
+    "light": {
+        "bg":            "#f3f3f5",
+        "surface":       "#ffffff",
+        "hover":         "#ececf0",
+        "border":        "#d9d9df",
+        "scrollbar":     "#c9c9d1",
+        "text":          "#1b1b1f",
+        "text2":         "#4a4a53",
+        "text3":         "#6b6b75",
+        "accent":        "#2563eb",
+        "accent_hover":  "#1d54d0",
+        "accent_pressed":"#1a47b0",
+        "accent_fg":     "#1f55d6",
+        "accent_subtle": "#dce7fc",
+        "on_accent":     "#ffffff",
+        "danger":        "#c4302b",
+    },
+}
+
+def _load_theme_pref() -> str:
+    """Read theme from data file before full app init."""
+    try:
+        base = (os.path.dirname(sys.executable)
+                if getattr(sys, "frozen", False)
+                else os.path.dirname(os.path.abspath(__file__)))
+        path = os.path.join(base, "overcut_data.json")
+        if os.path.exists(path):
+            with open(path) as f:
+                return json.load(f).get("theme", "dark")
+    except Exception:
+        pass
+    return "dark"
+
+CURRENT_THEME: str = _load_theme_pref()
+P: dict             = _THEMES.get(CURRENT_THEME, _THEMES["dark"])
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Font loader
-#  CRITICAL: call AFTER QApplication(), BEFORE any widget is created.
+#  Fonts
+#  CRITICAL: call _load_bundled_fonts() AFTER QApplication(), BEFORE any widget.
 # ─────────────────────────────────────────────────────────────────────────────
 
 _LOADED_FAMILIES: list[str] = []
 
 def _load_bundled_fonts() -> list[str]:
-    """
-    Scans fonts/ directory and registers every TTF/OTF with Qt.
-    Prints the exact family name Qt gives each font — use that in QFont/QSS.
-    """
+    """Registers every TTF/OTF in fonts/ with Qt and prints the family names."""
     if getattr(sys, "frozen", False):
-        # _MEIPASS  = PyInstaller temp dir where --add-data lands
-        # executable dir = persistent exe location (for data files)
         candidates = [sys._MEIPASS, os.path.dirname(sys.executable)]
     else:
         candidates = [os.path.dirname(os.path.abspath(__file__)), os.getcwd()]
@@ -106,101 +204,191 @@ def _load_bundled_fonts() -> list[str]:
                         print(f"  [Fonts] FAIL  {fname}")
             break
     else:
-        print("[Fonts] No fonts/ directory found — using system fonts.")
+        print("[Fonts] No fonts/ directory found, using system fonts.")
 
     return loaded
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Typography helpers — call after _load_bundled_fonts()
-# ─────────────────────────────────────────────────────────────────────────────
-
-_UI_CANDIDATES   = ["Inter", "DM Sans", "Segoe UI Variable Text", "Segoe UI"]
-_MONO_CANDIDATES = ["JetBrains Mono", "Cascadia Code", "Consolas"]
+_UI_CANDIDATES   = ["Segoe UI Variable Text", "Segoe UI", "Inter"]
+_MONO_CANDIDATES = ["Cascadia Mono", "Consolas", "JetBrains Mono"]
 
 def _best_family(candidates: list[str]) -> str:
-    available = QFontDatabase.families()
+    available = set(QFontDatabase.families())
     for c in candidates:
         if c in available:
             return c
     return candidates[-1]
 
-def ui_font(size: int, weight: QFont.Weight = QFont.Weight.Normal) -> QFont:
-    f = QFont(_best_family(_UI_CANDIDATES), size, weight)
+def _smooth(f: QFont) -> QFont:
+    """Antialiased, vertically hinted text for every font in the app."""
     f.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
+    f.setHintingPreference(QFont.HintingPreference.PreferVerticalHinting)
     return f
 
-def mono_font(size: int) -> QFont:
-    return QFont(_best_family(_MONO_CANDIDATES), size)
-
-def display_font(size: int, weight: QFont.Weight = QFont.Weight.Black) -> QFont:
-    return QFont("Zalando Sans Expanded", size, weight)
-
-def condensed_font(size: int, weight: QFont.Weight = QFont.Weight.Bold) -> QFont:
-    return QFont("Roboto Condensed", size, weight)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Palette
-# ─────────────────────────────────────────────────────────────────────────────
-
-P = {
-    "base":         "#080809",
-    "surface":      "#0f0f11",
-    "raised":       "#161618",
-    "overlay_bg":   "#111113",
-    "input":        "#1a1a1d",
-    "hover":        "#1e1e21",
-    "active":       "#252528",
-    "border":       "#232326",
-    "border_hi":    "#38383d",
-    "text":         "#ededef",
-    "text2":        "#8f8f99",
-    "muted":        "#4a4a52",
-    "accent":       "#4c7fff",
-    "accent_dim":   "#1c2e55",
-    "accent_hi":    "#7ba3ff",
-    "amber":        "#f0a030",
-    "red":          "#e84040",
-    "green":        "#34c769",
-    "badge_bg":     "#1a1a1e",
-    "badge_fg":     "#7a8599",
-    "sel_bg":       "#182040",
-    "sel_border":   "#3060cc",
+# role -> (pixel size, semibold, monospace)
+_ROLES = {
+    "caption":        (FS_CAPTION, False, False),
+    "caption_strong": (FS_CAPTION, True,  False),
+    "body":           (FS_BODY,    False, False),
+    "strong":         (FS_BODY,    True,  False),
+    "title":          (FS_TITLE,   True,  False),
+    "key":            (FS_CAPTION, False, True),   # key badges
+    "mono":           (FS_BODY,    False, True),   # key column, hotkey input
 }
 
-QSS_GLOBAL = f"""
-* {{
-    font-family: "Inter", "Segoe UI Variable Text", "Segoe UI", sans-serif;
-    font-size: 10pt;
-    color: {P["text"]};
-    outline: none;
-}}
-QScrollBar:vertical {{
-    background: transparent;
-    width: 5px;
-    margin: 0;
-}}
-QScrollBar::handle:vertical {{
-    background: {P["border_hi"]};
-    border-radius: 2px;
-    min-height: 30px;
-}}
-QScrollBar::handle:vertical:hover {{
-    background: {P["muted"]};
-}}
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
-QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: none; }}
-QScrollBar:horizontal {{ height: 0; }}
-QToolTip {{
-    background: {P["raised"]};
-    color: {P["text2"]};
-    border: 1px solid {P["border_hi"]};
-    border-radius: 4px;
-    padding: 4px 8px;
-    font-size: 9pt;
-}}
-"""
+def role_font(role: str) -> QFont:
+    px, bold, mono = _ROLES[role]
+    f = QFont(_best_family(_MONO_CANDIDATES if mono else _UI_CANDIDATES))
+    f.setPixelSize(px)
+    f.setWeight(QFont.Weight.DemiBold if bold else QFont.Weight.Normal)
+    return _smooth(f)
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Palette + stylesheet (small, token driven)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_palette() -> QPalette:
+    pal = QPalette()
+    c = lambda k: QColor(P[k])
+    R = QPalette.ColorRole
+    pal.setColor(R.Window,          c("bg"))
+    pal.setColor(R.WindowText,      c("text"))
+    pal.setColor(R.Base,            c("surface"))
+    pal.setColor(R.AlternateBase,   c("hover"))
+    pal.setColor(R.Text,            c("text"))
+    pal.setColor(R.Button,          c("surface"))
+    pal.setColor(R.ButtonText,      c("text"))
+    pal.setColor(R.ToolTipBase,     c("surface"))
+    pal.setColor(R.ToolTipText,     c("text"))
+    pal.setColor(R.Highlight,       c("accent"))
+    pal.setColor(R.HighlightedText, c("on_accent"))
+    pal.setColor(R.PlaceholderText, c("text3"))
+    for role in (R.WindowText, R.Text, R.ButtonText):
+        pal.setColor(QPalette.ColorGroup.Disabled, role, c("text3"))
+    return pal
+
+
+_QSS = Template("""
+QToolTip {
+    background: $surface; color: $text;
+    border: 1px solid $border; padding: ${s1}px ${s2}px;
+}
+
+QMenu {
+    background: $surface; color: $text;
+    border: 1px solid $border; padding: ${s1}px;
+}
+QMenu::item { padding: ${s2}px ${s5}px ${s2}px ${s3}px; border-radius: ${r_control}px; }
+QMenu::item:selected { background: $hover; }
+QMenu::separator { height: 1px; background: $border; margin: ${s1}px 0; }
+
+QScrollBar:vertical { background: transparent; width: ${s2}px; margin: 0; }
+QScrollBar::handle:vertical {
+    background: $scrollbar; border-radius: ${s1}px; min-height: ${s5}px;
+}
+QScrollBar::handle:vertical:hover { background: $text3; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none; }
+QScrollBar:horizontal { height: 0; }
+
+QPushButton {
+    background: $surface; color: $text;
+    border: 1px solid $border; border-radius: ${r_control}px;
+    padding: 0 ${s3}px;
+}
+QPushButton:hover    { background: $hover; }
+QPushButton:pressed  { background: $border; }
+QPushButton:focus    { border-color: $accent; }
+QPushButton:disabled { color: $text3; background: $surface; }
+
+QPushButton[variant="primary"] {
+    background: $accent; border-color: $accent; color: $on_accent;
+}
+QPushButton[variant="primary"]:hover    { background: $accent_hover;   border-color: $accent_hover; }
+QPushButton[variant="primary"]:pressed  { background: $accent_pressed; border-color: $accent_pressed; }
+QPushButton[variant="primary"]:focus    { border-color: $text; }
+QPushButton[variant="primary"]:disabled { background: $hover; border-color: $border; color: $text3; }
+
+QPushButton[variant="danger"]         { color: $danger; }
+QPushButton[variant="danger"]:hover   { border-color: $danger; }
+QPushButton[variant="danger"]:disabled { color: $text3; }
+
+QPushButton[seg="true"] {
+    background: transparent; border: none; border-radius: 3px;
+    padding: 0 ${s3}px; color: $text2; min-width: ${s5}px;
+}
+QPushButton[seg="true"]:hover   { color: $text; background: transparent; }
+QPushButton[seg="true"]:pressed { background: $hover; }
+QPushButton[seg="true"]:checked { background: $accent_subtle; color: $text; }
+QPushButton[seg="true"]:focus   { border: none; }
+
+QLineEdit {
+    background: $surface; border: 1px solid $border;
+    border-radius: ${r_control}px; padding: 0 ${s2}px;
+    selection-background-color: $accent; selection-color: $on_accent;
+}
+QLineEdit:focus    { border-color: $accent; }
+QLineEdit:disabled { color: $text3; }
+QLineEdit[listening="true"] { background: $accent_subtle; border-color: $accent; }
+QLineEdit[embedded="true"]  { background: transparent; border: none; padding: 0; }
+
+QFrame#Card {
+    background: $surface; border: 1px solid $border;
+    border-radius: ${r_panel}px;
+}
+QFrame#OverlayCard {
+    background: $surface; border: 1px solid $border;
+    border-radius: ${r_max}px;
+}
+QFrame#BarBottom { background: $surface; border: none; border-bottom: 1px solid $border; }
+QFrame#BarTop    { background: $surface; border: none; border-top: 1px solid $border; }
+QFrame#Divider   { background: $border; border: none; }
+QFrame#Segmented {
+    background: $bg; border: 1px solid $border; border-radius: ${r_control}px;
+}
+
+QListWidget#Sidebar {
+    background: transparent; border: none; outline: none; padding: ${s1}px;
+}
+QListWidget#Sidebar::item {
+    padding: 0 ${s2}px; border-radius: ${r_control}px; color: $text2;
+}
+QListWidget#Sidebar::item:hover    { background: $hover; color: $text; }
+QListWidget#Sidebar::item:selected { background: $accent_subtle; color: $text; }
+
+QTreeWidget#Table { background: transparent; border: none; outline: none; }
+QTreeWidget#Table::item { padding: 0 ${s2}px; }
+QTreeWidget#Table::item:hover    { background: $hover; }
+QTreeWidget#Table::item:selected { background: $accent_subtle; color: $text; }
+QHeaderView::section {
+    background: transparent; color: $text3; border: none;
+    border-bottom: 1px solid $border; padding: 0 ${s2}px 0 ${header_inset}px;
+}
+
+QTextEdit#Doc {
+    background: $surface; border: 1px solid $border;
+    border-radius: ${r_panel}px; padding: ${s2}px;
+    selection-background-color: $accent; selection-color: $on_accent;
+}
+
+QWidget#Row { background: transparent; border-left: 2px solid transparent; }
+QWidget#Row:hover { background: $hover; }
+QWidget#Row[selected="true"] { background: $accent_subtle; border-left: 2px solid $accent; }
+
+QLabel[badge="true"] {
+    background: $hover; color: $text2;
+    border: 1px solid $border; border-radius: ${r_control}px;
+    padding: 0 ${s2}px;
+}
+QLabel[badge="true"][selected="true"] {
+    background: $surface; color: $accent_fg; border-color: $accent;
+}
+""")
+
+def build_qss() -> str:
+    return _QSS.substitute(
+        P, s1=S1, s2=S2, s3=S3, s4=S4, s5=S5,
+        r_control=RADIUS_CONTROL, r_panel=RADIUS_PANEL, r_max=RADIUS_MAX,
+        header_inset=S2 + 3)   # Qt adds a 3 px text margin to tree items
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Data
@@ -284,205 +472,553 @@ class HotkeyThread(QThread):
         self.wait()
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Reusable widgets
+#  Reusable components
 # ─────────────────────────────────────────────────────────────────────────────
+
+def set_prop(widget: QWidget, name: str, value: str) -> None:
+    """Set a dynamic property and re-evaluate the stylesheet for it."""
+    widget.setProperty(name, value)
+    widget.style().unpolish(widget)
+    widget.style().polish(widget)
+
+
+_TONES = {
+    "primary":   "text",
+    "secondary": "text2",
+    "tertiary":  "text3",
+    "accent":    "accent_fg",
+    "danger":    "danger",
+}
+
+
+class Label(QLabel):
+    """Text with a type role and an emphasis tone. No stylesheet involved."""
+
+    def __init__(self, text: str = "", role: str = "body",
+                 tone: str = "primary", parent=None):
+        super().__init__(text, parent)
+        self.setFont(role_font(role))
+        self.set_tone(tone)
+
+    def set_tone(self, tone: str) -> None:
+        pal = self.palette()
+        pal.setColor(QPalette.ColorRole.WindowText, QColor(P[_TONES[tone]]))
+        self.setPalette(pal)
+
+
+class SectionHeader(Label):
+    def __init__(self, text: str, parent=None):
+        super().__init__(text, "caption_strong", "tertiary", parent)
+
 
 class Divider(QFrame):
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setObjectName("Divider")
         self.setFixedHeight(1)
-        self.setStyleSheet(f"background: {P['border']}; border: none;")
 
 
-class GhostButton(QPushButton):
-    def __init__(self, text, parent=None, accent=False):
-        super().__init__(text, parent)
-        if accent:
-            self.setStyleSheet(f"""
-                QPushButton {{
-                    background: {P['accent']};
-                    color: #ffffff;
-                    border: none;
-                    border-radius: 6px;
-                    padding: 7px 16px;
-                    font-weight: 600;
-                    font-size: 9pt;
-                }}
-                QPushButton:hover {{ background: {P['accent_hi']}; }}
-                QPushButton:pressed {{ background: {P['accent_dim']}; }}
-            """)
-        else:
-            self.setStyleSheet(f"""
-                QPushButton {{
-                    background: {P['input']};
-                    color: {P['text2']};
-                    border: 1px solid {P['border']};
-                    border-radius: 6px;
-                    padding: 7px 14px;
-                    font-size: 9pt;
-                }}
-                QPushButton:hover {{
-                    background: {P['hover']};
-                    color: {P['text']};
-                    border-color: {P['border_hi']};
-                }}
-                QPushButton:pressed {{ background: {P['active']}; }}
-            """)
-        self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+class AppCard(QFrame):
+    """A bordered surface. Use only where it groups content."""
 
-
-class StyledInput(QLineEdit):
-    def __init__(self, placeholder="", parent=None):
+    def __init__(self, parent=None):
         super().__init__(parent)
+        self.setObjectName("Card")
+
+
+class AppButton(QPushButton):
+    """variant: 'secondary' (default), 'primary' or 'danger'."""
+
+    def __init__(self, text: str = "", variant: str = "secondary", parent=None):
+        super().__init__(text, parent)
+        self.setProperty("variant", variant)
+        self.setFont(role_font("body"))
+        self.setFixedHeight(CONTROL_H)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        # Keyboard focus ring only; mouse clicks should not leave a ring behind.
+        self.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+
+
+class AppLineEdit(QLineEdit):
+    def __init__(self, text: str = "", placeholder: str = "", parent=None):
+        super().__init__(text, parent)
         self.setPlaceholderText(placeholder)
-        self.setStyleSheet(f"""
-            QLineEdit {{
-                background: {P['input']};
-                color: {P['text']};
-                border: 1px solid {P['border']};
-                border-radius: 6px;
-                padding: 8px 12px;
-                font-size: 10pt;
-                selection-background-color: {P['accent_dim']};
-            }}
-            QLineEdit:focus {{ border-color: {P['accent']}; }}
-        """)
+        self.setFont(role_font("body"))
+        self.setFixedHeight(CONTROL_H)
+
+
+class KeyBadge(QLabel):
+    """Monospace key label, e.g. Ctrl+Shift+S."""
+
+    def __init__(self, text: str, parent=None):
+        super().__init__(text, parent)
+        self.setProperty("badge", "true")
+        self.setProperty("selected", "false")
+        self.setFont(role_font("key"))
+        self.setFixedHeight(S5 - S1)           # 20
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+
+class IconButton(QPushButton):
+    """Vector icon button (drawn with QPainter, sharp at any DPI)."""
+
+    def __init__(self, kind: str, tooltip: str = "", parent=None):
+        super().__init__(parent)
+        self._kind = kind
+        self.setFixedSize(S5 + S1, S5 + S1)    # 28
+        self.setToolTip(tooltip)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        hot = self.underMouse() or self.hasFocus()
+        if hot:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(P["hover"]))
+            p.drawRoundedRect(QRectF(self.rect()), RADIUS_CONTROL, RADIUS_CONTROL)
+        pen = QPen(QColor(P["text"] if hot else P["text2"]), 1.5)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        cx, cy, r = self.width() / 2, self.height() / 2, 5
+        if self._kind == "close":
+            p.drawLine(QPointF(cx - r, cy - r), QPointF(cx + r, cy + r))
+            p.drawLine(QPointF(cx - r, cy + r), QPointF(cx + r, cy - r))
+        p.end()
+
+
+class SearchIcon(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(S4, S4)
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(QColor(P["text3"]), 1.5)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawEllipse(QRectF(1.75, 1.75, 9, 9))
+        p.drawLine(QPointF(9.5, 9.5), QPointF(14, 14))
+        p.end()
+
+
+class Switch(QAbstractButton):
+    """On/off toggle. Space toggles when focused."""
+
+    def __init__(self, checked: bool = False, parent=None):
+        super().__init__(parent)
+        self.setCheckable(True)
+        self.setChecked(checked)
+        self.setFixedSize(36, 20)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h, on = self.width(), self.height(), self.isChecked()
+        edge = P["text"] if self.hasFocus() else (P["accent"] if on else P["text3"])
+        p.setPen(QPen(QColor(edge), 1))
+        p.setBrush(QColor(P["accent"]) if on else Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(QRectF(0.5, 0.5, w - 1, h - 1), h / 2, h / 2)
+        d = 12
+        x = w - S1 - d if on else S1
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(P["on_accent"] if on else P["text3"]))
+        p.drawEllipse(QRectF(x, (h - d) / 2, d, d))
+        p.end()
+
+
+class Segmented(QFrame):
+    """Small exclusive option group, e.g. Dark | Light."""
+    changed = pyqtSignal(str)
+
+    def __init__(self, options: list[str], current: str, parent=None):
+        super().__init__(parent)
+        self.setObjectName("Segmented")
+        self.setFixedHeight(CONTROL_H)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        for opt in options:
+            b = QPushButton(opt)
+            b.setProperty("seg", "true")
+            b.setCheckable(True)
+            b.setAutoExclusive(True)
+            b.setChecked(opt == current)
+            b.setFont(role_font("body"))
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+            b.setSizePolicy(QSizePolicy.Policy.Preferred,
+                            QSizePolicy.Policy.Expanding)
+            b.clicked.connect(lambda _=False, o=opt: self.changed.emit(o))
+            lay.addWidget(b)
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Overlay — ShortcutRow / CategoryHeader
+#  Key capture input
+# ─────────────────────────────────────────────────────────────────────────────
+
+class KeyCaptureInput(AppLineEdit):
+    """Click to enter listening mode, press any key/mouse combo to capture it."""
+
+    _MOUSE = {
+        Qt.MouseButton.MiddleButton: "Mouse3",
+        Qt.MouseButton.BackButton:   "Mouse4",
+        Qt.MouseButton.ForwardButton:"Mouse5",
+        Qt.MouseButton.TaskButton:   "Mouse6",
+        Qt.MouseButton.ExtraButton4: "Mouse7",
+        Qt.MouseButton.ExtraButton5: "Mouse8",
+    }
+    _NUMPAD = {
+        Qt.Key.Key_0: "Num0", Qt.Key.Key_1: "Num1", Qt.Key.Key_2: "Num2",
+        Qt.Key.Key_3: "Num3", Qt.Key.Key_4: "Num4", Qt.Key.Key_5: "Num5",
+        Qt.Key.Key_6: "Num6", Qt.Key.Key_7: "Num7", Qt.Key.Key_8: "Num8",
+        Qt.Key.Key_9: "Num9",
+        Qt.Key.Key_Plus:     "Num+",  Qt.Key.Key_Minus:    "Num-",
+        Qt.Key.Key_Asterisk: "Num*",  Qt.Key.Key_Slash:    "Num/",
+        Qt.Key.Key_Period:   "Num.",  Qt.Key.Key_Enter:    "NumEnter",
+        Qt.Key.Key_Delete:   "NumDel",Qt.Key.Key_Insert:   "Num0",
+        Qt.Key.Key_Home:     "Num7",  Qt.Key.Key_End:      "Num1",
+        Qt.Key.Key_PageUp:   "Num9",  Qt.Key.Key_PageDown: "Num3",
+        Qt.Key.Key_Left:     "Num4",  Qt.Key.Key_Right:    "Num6",
+        Qt.Key.Key_Up:       "Num8",  Qt.Key.Key_Down:     "Num2",
+        Qt.Key.Key_Clear:    "Num5",
+    }
+    _SPECIAL = {
+        Qt.Key.Key_Return:    "Enter",  Qt.Key.Key_Enter:    "NumEnter",
+        Qt.Key.Key_Tab:       "Tab",    Qt.Key.Key_Backspace: "Backspace",
+        Qt.Key.Key_Delete:    "Delete", Qt.Key.Key_Insert:   "Insert",
+        Qt.Key.Key_Home:      "Home",   Qt.Key.Key_End:      "End",
+        Qt.Key.Key_PageUp:    "PageUp", Qt.Key.Key_PageDown: "PageDown",
+        Qt.Key.Key_Left:      "Left",   Qt.Key.Key_Right:    "Right",
+        Qt.Key.Key_Up:        "Up",     Qt.Key.Key_Down:     "Down",
+        Qt.Key.Key_Space:     "Space",
+        Qt.Key.Key_F1:  "F1",  Qt.Key.Key_F2:  "F2",  Qt.Key.Key_F3:  "F3",
+        Qt.Key.Key_F4:  "F4",  Qt.Key.Key_F5:  "F5",  Qt.Key.Key_F6:  "F6",
+        Qt.Key.Key_F7:  "F7",  Qt.Key.Key_F8:  "F8",  Qt.Key.Key_F9:  "F9",
+        Qt.Key.Key_F10: "F10", Qt.Key.Key_F11: "F11", Qt.Key.Key_F12: "F12",
+        Qt.Key.Key_Print:      "PrintScr",
+        Qt.Key.Key_ScrollLock: "ScrollLock",
+        Qt.Key.Key_Pause:      "Pause",
+        Qt.Key.Key_CapsLock:   "CapsLock",
+    }
+    _MODS = (
+        Qt.Key.Key_Control, Qt.Key.Key_Shift,
+        Qt.Key.Key_Alt, Qt.Key.Key_Meta, Qt.Key.Key_AltGr,
+    )
+
+    _IDLE_HINT      = "Click to capture"
+    _LISTENING_HINT = "Press a key or mouse button"
+
+    def __init__(self, parent=None):
+        super().__init__("", self._IDLE_HINT, parent)
+        self.setFont(role_font("mono"))
+        self.setReadOnly(True)
+        self._listening = False
+        self.setProperty("listening", "false")
+
+    # ── Events ────────────────────────────────────────────────────────────────
+
+    def mousePressEvent(self, event):
+        if not self._listening:
+            self._start_listening()
+        # Left/right clicks are UI actions while listening: ignore them.
+        event.accept()
+
+    def keyPressEvent(self, event):
+        if not self._listening:
+            super().keyPressEvent(event)
+            return
+        key  = event.key()
+        mods = event.modifiers()
+        if key in self._MODS:
+            return
+        if key == Qt.Key.Key_Escape:
+            self._cancel()
+            return
+        is_numpad = bool(mods & Qt.KeyboardModifier.KeypadModifier)
+        clean_mods = mods & ~Qt.KeyboardModifier.KeypadModifier
+        mod_str = self._mods(clean_mods)
+        if is_numpad:
+            key_name = self._NUMPAD.get(key, "Num?")
+        else:
+            key_name = self._SPECIAL.get(key) or (
+                event.text().upper() if event.text().isprintable()
+                else f"Key{key}")
+        combo = f"{mod_str}+{key_name}" if mod_str else key_name
+        self._commit(combo)
+
+    def eventFilter(self, obj, event):
+        """Global mouse filter, active only while listening."""
+        if self._listening and event.type() == QEvent.Type.MouseButtonPress:
+            btn = event.button()
+            if btn in self._MOUSE:
+                mods  = self._mods(event.modifiers())
+                name  = self._MOUSE[btn]
+                combo = f"{mods}+{name}" if mods else name
+                self._commit(combo)
+                return True  # consume event
+        return False
+
+    def focusOutEvent(self, event):
+        if self._listening:
+            self._cancel()
+        super().focusOutEvent(event)
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _set_listening(self, on: bool):
+        self._listening = on
+        self.setPlaceholderText(self._LISTENING_HINT if on else self._IDLE_HINT)
+        set_prop(self, "listening", "true" if on else "false")
+
+    def _start_listening(self):
+        self.setText("")
+        self._set_listening(True)
+        QApplication.instance().installEventFilter(self)
+
+    def _commit(self, combo: str):
+        self.setText(combo)
+        self._set_listening(False)
+        QApplication.instance().removeEventFilter(self)
+
+    def _cancel(self):
+        self._set_listening(False)
+        QApplication.instance().removeEventFilter(self)
+
+    @staticmethod
+    def _mods(m: Qt.KeyboardModifier) -> str:
+        parts = []
+        if m & Qt.KeyboardModifier.ControlModifier: parts.append("Ctrl")
+        if m & Qt.KeyboardModifier.ShiftModifier:   parts.append("Shift")
+        if m & Qt.KeyboardModifier.AltModifier:     parts.append("Alt")
+        if m & Qt.KeyboardModifier.MetaModifier:    parts.append("Win")
+        return "+".join(parts)
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Dialogs (native window frame, shared layout rules)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class BaseDialog(QDialog):
+    def __init__(self, parent, title: str, min_width: int = 400):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setModal(True)
+        self.setMinimumWidth(min_width)
+        self.root = QVBoxLayout(self)
+        self.root.setContentsMargins(S5, S5, S5, S5)
+        self.root.setSpacing(S4)
+
+    @staticmethod
+    def field(label: str, widget: QWidget, hint: str = "") -> QWidget:
+        box = QWidget()
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(S1)
+        lay.addWidget(Label(label, "caption_strong", "secondary"))
+        lay.addWidget(widget)
+        if hint:
+            h = Label(hint, "caption", "tertiary")
+            h.setWordWrap(True)
+            lay.addWidget(h)
+        return box
+
+    def add_buttons(self, ok_text: str, on_ok, ok_variant: str = "primary",
+                    cancel_text: str | None = "Cancel") -> AppButton:
+        row = QHBoxLayout()
+        row.setSpacing(S2)
+        row.addStretch()
+        if cancel_text:
+            cancel = AppButton(cancel_text)
+            cancel.setAutoDefault(False)
+            cancel.clicked.connect(self.reject)
+            row.addWidget(cancel)
+        ok = AppButton(ok_text, ok_variant)
+        ok.setDefault(True)
+        ok.clicked.connect(on_ok)
+        row.addWidget(ok)
+        self.root.addLayout(row)
+        return ok
+
+
+class MessageDialog(BaseDialog):
+    def __init__(self, parent, title: str, text: str, confirm_text: str = "OK",
+                 danger: bool = False, cancel_text: str | None = None):
+        super().__init__(parent, title, 360)
+        msg = Label(text, "body")
+        msg.setWordWrap(True)
+        self.root.addWidget(msg)
+        self.add_buttons(confirm_text, self.accept,
+                         "danger" if danger else "primary", cancel_text)
+
+
+class InputDialog(BaseDialog):
+    def __init__(self, parent, title: str, prompt: str):
+        super().__init__(parent, title, 360)
+        self.value = ""
+        self.inp = AppLineEdit()
+        self.root.addWidget(self.field(prompt, self.inp))
+        self.add_buttons("OK", self._ok)
+
+    def _ok(self):
+        self.value = self.inp.text()
+        self.accept()
+
+
+class ShortcutDialog(BaseDialog):
+    def __init__(self, parent, key: str = "", action: str = ""):
+        super().__init__(parent, "Edit shortcut" if key else "New shortcut", 400)
+        self.result_data = None
+
+        self.key_inp = KeyCaptureInput()
+        self.key_inp.setText(key)
+        self.root.addWidget(self.field(
+            "Shortcut key", self.key_inp,
+            "Click the field, then press the keys."))
+
+        self.action_inp = AppLineEdit(action)
+        self.root.addWidget(self.field("Action", self.action_inp))
+
+        self.add_buttons("Save", self._save)
+
+    def _save(self):
+        k = self.key_inp.text().strip()
+        a = self.action_inp.text().strip()
+        if k and a:
+            self.result_data = {"key": k, "action": a}
+            self.accept()
+
+
+class ChangelogDialog(BaseDialog):
+    def __init__(self, parent):
+        super().__init__(parent, "Changelog", 560)
+        self.resize(560, 480)
+        view = QTextEdit()
+        view.setObjectName("Doc")
+        view.setReadOnly(True)
+        view.setFont(role_font("body"))
+        view.setHtml(self._load_changelog())
+        self.root.addWidget(view, 1)
+        self.add_buttons("Close", self.accept, "primary", None)
+
+    def _load_changelog(self) -> str:
+        # CHANGELOG.md is bundled in _MEIPASS or sits next to the script/exe
+        for base in (
+            getattr(sys, "_MEIPASS", None),
+            os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else None,
+            os.path.dirname(os.path.abspath(__file__)),
+            os.getcwd(),
+        ):
+            if base is None:
+                continue
+            path = os.path.join(base, "CHANGELOG.md")
+            if os.path.exists(path):
+                with open(path, encoding="utf-8") as f:
+                    return self._md_to_html(f.read())
+        return f"<p style='color:{P['text3']}'>CHANGELOG.md not found.</p>"
+
+    @staticmethod
+    def _md_to_html(md: str) -> str:
+        """Basic markdown to HTML: handles #, ##, **, -, blank lines."""
+        def inline(s: str) -> str:
+            return re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", html.escape(s))
+
+        out = []
+        for line in md.splitlines():
+            if line.startswith("## "):
+                out.append(
+                    f'<p style="margin:{S4}px 0 {S1}px 0; color:{P["text"]}; '
+                    f'font-size:{FS_BODY}px; font-weight:600;">{inline(line[3:])}</p>')
+            elif line.startswith("# "):
+                out.append(
+                    f'<p style="margin:0 0 {S2}px 0; color:{P["text"]}; '
+                    f'font-size:{FS_TITLE}px; font-weight:600;">{inline(line[2:])}</p>')
+            elif line.startswith("- "):
+                out.append(
+                    f'<p style="margin:0 0 {S1}px {S3}px; color:{P["text2"]};">'
+                    f'&bull;&nbsp; {inline(line[2:])}</p>')
+            elif line.startswith("**") and line.endswith("**"):
+                out.append(
+                    f'<p style="margin:{S2}px 0 {S1}px 0; color:{P["text"]}; '
+                    f'font-weight:600;">{inline(line[2:-2])}</p>')
+            elif line.strip() == "":
+                out.append(f'<p style="margin:0 0 {S1}px 0;"></p>')
+            else:
+                out.append(
+                    f'<p style="margin:0 0 {S1}px 0; color:{P["text2"]};">{inline(line)}</p>')
+        return "".join(out)
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Overlay: rows and window
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ShortcutRow(QWidget):
-    ROW_H = 42
+    ROW_H = 36
 
-    def __init__(self, key: str, action: str, parent=None):
+    def __init__(self, key: str, action: str, key_col_w: int,
+                 query: str = "", parent=None):
         super().__init__(parent)
-        self.key       = key
-        self.action    = action
-        self._selected = False
+        self.key    = key
+        self.action = action
+        self.setObjectName("Row")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setFixedHeight(self.ROW_H)
-        self._build()
+        self.setProperty("selected", "false")
 
-    def _build(self):
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(SP2, 0, SP2, 0)
-        lay.setSpacing(SP + 4)
+        # 2 px is the selection bar, so text lines up with the header at 16
+        lay.setContentsMargins(S4 - 2, 0, S4, 0)
+        lay.setSpacing(S3)
 
-        self.badge = QLabel(self.key)
-        self.badge.setFont(mono_font(8))
-        self.badge.setFixedHeight(22)
-        self.badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.badge.setStyleSheet(f"""
-            QLabel {{
-                background: {P['badge_bg']};
-                color: {P['badge_fg']};
-                border: 1px solid {P['border']};
-                border-radius: 4px;
-                padding: 0px 8px;
-                min-width: 64px;
-            }}
-        """)
+        # Fixed key column: every action starts at the same x position
+        key_col = QWidget()
+        key_col.setFixedWidth(key_col_w)
+        kl = QHBoxLayout(key_col)
+        kl.setContentsMargins(0, 0, 0, 0)
+        self.badge = KeyBadge(key)
+        kl.addWidget(self.badge)
+        kl.addStretch()
 
-        self.action_lbl = QLabel(self.action)
-        self.action_lbl.setFont(ui_font(9))
-        self.action_lbl.setStyleSheet(
-            f"color: {P['text2']}; background: transparent;")
+        self.action_lbl = Label("", "body", "secondary")
+        self.action_lbl.setTextFormat(Qt.TextFormat.RichText)
+        self.action_lbl.setText(self._action_html(query))
 
-        lay.addWidget(self.badge)
+        lay.addWidget(key_col)
         lay.addWidget(self.action_lbl, 1)
-        self._refresh_style()
+
+    def _action_html(self, query: str) -> str:
+        text = self.action
+        i = text.lower().find(query) if query else -1
+        if i < 0:
+            return html.escape(text)
+        a, m, b = text[:i], text[i:i + len(query)], text[i + len(query):]
+        return (f'{html.escape(a)}<span style="color:{P["accent_fg"]}; '
+                f'font-weight:600;">{html.escape(m)}</span>{html.escape(b)}')
 
     def set_selected(self, v: bool):
-        self._selected = v
-        self._refresh_style()
-
-    def set_highlight(self, query: str):
-        q = query.strip().lower()
-        if q and (q in self.key.lower() or q in self.action.lower()):
-            self.badge.setStyleSheet(f"""
-                QLabel {{
-                    background: #2a1f00;
-                    color: {P['amber']};
-                    border: 1px solid #5a3a00;
-                    border-radius: 4px;
-                    padding: 0px 8px;
-                    min-width: 64px;
-                }}
-            """)
-            self.action_lbl.setStyleSheet(
-                f"color: {P['amber']}; background: transparent;")
-        else:
-            self._refresh_style()
-
-    def _refresh_style(self):
-        if self._selected:
-            self.setStyleSheet(f"""
-                ShortcutRow {{
-                    background: {P['sel_bg']};
-                    border-left: 2px solid {P['accent']};
-                }}
-            """)
-            self.badge.setStyleSheet(f"""
-                QLabel {{
-                    background: {P['accent']};
-                    color: #ffffff;
-                    border: none;
-                    border-radius: 4px;
-                    padding: 0px 8px;
-                    min-width: 64px;
-                    font-weight: 600;
-                }}
-            """)
-            self.action_lbl.setStyleSheet(
-                f"color: {P['text']}; background: transparent; font-weight: 500;")
-        else:
-            self.setStyleSheet(f"""
-                ShortcutRow {{
-                    background: transparent;
-                    border-left: 2px solid transparent;
-                }}
-                ShortcutRow:hover {{ background: {P['hover']}; }}
-            """)
-            self.badge.setStyleSheet(f"""
-                QLabel {{
-                    background: {P['badge_bg']};
-                    color: {P['badge_fg']};
-                    border: 1px solid {P['border']};
-                    border-radius: 4px;
-                    padding: 0px 8px;
-                    min-width: 64px;
-                }}
-            """)
-            self.action_lbl.setStyleSheet(
-                f"color: {P['text2']}; background: transparent;")
+        flag = "true" if v else "false"
+        set_prop(self, "selected", flag)
+        set_prop(self.badge, "selected", flag)
+        self.action_lbl.set_tone("primary" if v else "secondary")
 
 
 class CategoryHeader(QWidget):
     def __init__(self, title: str, parent=None):
         super().__init__(parent)
-        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.setFixedHeight(32)
+        self.setFixedHeight(CONTROL_H)
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(SP2, 0, SP2, 0)
-
-        dot = QLabel("◆")
-        dot.setFont(ui_font(7))
-        dot.setStyleSheet(f"color: {P['accent']}; background: transparent;")
-
-        lbl = QLabel(f"  {title.upper()}")
-        lbl.setFont(ui_font(7, QFont.Weight.Bold))
-        lbl.setStyleSheet(f"color: {P['muted']}; background: transparent;")
-
-        lay.addWidget(dot)
-        lay.addWidget(lbl)
+        lay.setContentsMargins(S4, 0, S4, 0)
+        lay.addWidget(SectionHeader(title))
         lay.addStretch()
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Overlay Window
-# ─────────────────────────────────────────────────────────────────────────────
 
 class OverlayWindow(QWidget):
+    WIDTH, HEIGHT, MARGIN = 600, 500, S5
+
     def __init__(self, data: dict):
         super().__init__()
         self.data      = data
@@ -503,200 +1039,100 @@ class OverlayWindow(QWidget):
             Qt.WindowType.WindowStaysOnTopHint |
             Qt.WindowType.Tool
         )
+        # Translucent only so the rounded corners are clean. The card itself
+        # is fully opaque, so text is never drawn on a see-through surface.
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setFixedSize(600, 500)
+        self.setFixedSize(self.WIDTH, self.HEIGHT)
+        self._place()
 
+    def _place(self):
         screen = QApplication.primaryScreen().availableGeometry()
-        self.move(screen.right() - self.width() - 52,
-                  screen.bottom() - self.height() - 60)
-
-        self._anim = QPropertyAnimation(self, b"geometry")
-        self._anim.setDuration(160)
-        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.move(screen.right() - self.width() - self.MARGIN,
+                  screen.bottom() - self.height() - self.MARGIN)
 
     def _build_ui(self):
-        root_layout = QVBoxLayout(self)
-        root_layout.setContentsMargins(0, 0, 0, 0)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
 
-        self.card = QFrame()
-        self.card.setObjectName("OverlayCard")
-        self.card.setStyleSheet(f"""
-            QFrame#OverlayCard {{
-                background: {P['overlay_bg']};
-                border: 1px solid {P['border_hi']};
-                border-radius: 12px;
-            }}
-        """)
+        card = QFrame()
+        card.setObjectName("OverlayCard")
+        root.addWidget(card)
 
-        shadow = QGraphicsDropShadowEffect()
-        shadow.setBlurRadius(40)
-        shadow.setOffset(0, 8)
-        shadow.setColor(QColor(0, 0, 0, 180))
-        self.card.setGraphicsEffect(shadow)
-
-        root_layout.addWidget(self.card)
-
-        card_layout = QVBoxLayout(self.card)
-        card_layout.setContentsMargins(0, 0, 0, 0)
-        card_layout.setSpacing(0)
+        cl = QVBoxLayout(card)
+        cl.setContentsMargins(0, 0, 0, 0)
+        cl.setSpacing(0)
 
         # ── Header ──
         header = QWidget()
-        header.setFixedHeight(54)
-        header.setStyleSheet(f"""
-            background: {P['surface']};
-            border-top-left-radius: 12px;
-            border-top-right-radius: 12px;
-        """)
-        h_lay = QHBoxLayout(header)
-        h_lay.setContentsMargins(SP2 + 2, 0, SP + 6, 0)
-
-        icon_lbl = QLabel("⌨")
-        icon_lbl.setFont(QFont("Segoe UI Emoji", 14))
-        icon_lbl.setStyleSheet(f"color: {P['accent']}; background: transparent;")
-
-        title_lbl = QLabel("OverCut")
-        title_lbl.setFont(ui_font(13, QFont.Weight.Bold))
-        title_lbl.setStyleSheet(f"color: {P['text']}; background: transparent;")
-        
-
-        hint_frame = QWidget()
-        hint_frame.setStyleSheet("background: transparent;")
-        hint_lay = QHBoxLayout(hint_frame)
-        hint_lay.setContentsMargins(0, 0, 0, 0)
-        hint_lay.setSpacing(4)
-
-        for txt in ["↑ ↓  nav", "scroll", "Esc"]:
-            pill = QLabel(txt)
-            pill.setFont(mono_font(7))
-            pill.setStyleSheet(f"""
-                color: {P['muted']};
-                background: {P['raised']};
-                border: 1px solid {P['border']};
-                border-radius: 4px;
-                padding: 2px 7px;
-            """)
-            hint_lay.addWidget(pill)
-
-        close_btn = QPushButton("×")
-        close_btn.setFixedSize(28, 28)
-        close_btn.setFont(ui_font(14))
-        close_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: transparent;
-                color: {P['muted']};
-                border: none;
-                border-radius: 6px;
-            }}
-            QPushButton:hover {{
-                background: {P['red']}22;
-                color: {P['red']};
-            }}
-        """)
-        close_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        header.setFixedHeight(S5 + S4)                      # 40
+        hl = QHBoxLayout(header)
+        hl.setContentsMargins(S4, 0, S2, 0)
+        hl.setSpacing(S3)
+        hl.addWidget(Label("OverCut", "strong"))
+        hl.addStretch()
+        hl.addWidget(Label("\u2191\u2193 navigate", "caption", "tertiary"))
+        hl.addWidget(Label("Esc close", "caption", "tertiary"))
+        close_btn = IconButton("close", "Close")
         close_btn.clicked.connect(self.hide_overlay)
-
-        h_lay.addWidget(icon_lbl)
-        h_lay.addWidget(title_lbl)
-        h_lay.addSpacing(SP)
-        h_lay.addStretch()
-        h_lay.addWidget(hint_frame)
-        h_lay.addSpacing(SP)
-        h_lay.addWidget(close_btn)
-
-        card_layout.addWidget(header)
-        card_layout.addWidget(Divider())
+        hl.addWidget(close_btn)
+        cl.addWidget(header)
+        cl.addWidget(Divider())
 
         # ── Search ──
-        search_wrap = QWidget()
-        search_wrap.setFixedHeight(50)
-        search_wrap.setStyleSheet(f"background: {P['raised']}; border: none;")
-        s_lay = QHBoxLayout(search_wrap)
-        s_lay.setContentsMargins(SP2, SP, SP2, SP)
-        s_lay.setSpacing(SP + 2)
-
-        search_icon = QLabel("⌕")
-        search_icon.setFont(ui_font(14))
-        search_icon.setStyleSheet(
-            f"color: {P['muted']}; background: transparent;")
+        search = QWidget()
+        search.setFixedHeight(S5 + S4)                      # 40
+        sl = QHBoxLayout(search)
+        sl.setContentsMargins(S4, 0, S4, 0)
+        sl.setSpacing(S2)
 
         self.search_box = QLineEdit()
-        self.search_box.setPlaceholderText("Search shortcuts…")
-        self.search_box.setFont(ui_font(10))
-        self.search_box.setStyleSheet(f"""
-            QLineEdit {{
-                background: transparent;
-                color: {P['text']};
-                border: none;
-                padding: 0;
-                selection-background-color: {P['accent_dim']};
-            }}
-        """)
+        self.search_box.setProperty("embedded", "true")
+        self.search_box.setFont(role_font("body"))
+        self.search_box.setPlaceholderText("Search shortcuts")
         self.search_box.textChanged.connect(self._on_search)
 
-        self.match_lbl = QLabel("")
-        self.match_lbl.setFont(ui_font(8))
-        self.match_lbl.setStyleSheet(
-            f"color: {P['muted']}; background: transparent;")
+        self.match_lbl = Label("", "caption", "tertiary")
 
-        s_lay.addWidget(search_icon)
-        s_lay.addWidget(self.search_box, 1)
-        s_lay.addWidget(self.match_lbl)
+        sl.addWidget(SearchIcon())
+        sl.addWidget(self.search_box, 1)
+        sl.addWidget(self.match_lbl)
+        cl.addWidget(search)
+        cl.addWidget(Divider())
 
-        card_layout.addWidget(search_wrap)
-        card_layout.addWidget(Divider())
-
-        # ── Scroll area ──
+        # ── List ──
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.scroll.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.scroll.setStyleSheet(
-            f"background: {P['overlay_bg']}; border: none;")
 
         self.list_widget = QWidget()
-        self.list_widget.setStyleSheet(
-            f"background: {P['overlay_bg']}; border: none;")
         self.list_layout = QVBoxLayout(self.list_widget)
-        self.list_layout.setContentsMargins(0, SP - 2, 0, SP - 2)
+        self.list_layout.setContentsMargins(0, S2, 0, S2)
         self.list_layout.setSpacing(0)
         self.list_layout.addStretch()
 
         self.scroll.setWidget(self.list_widget)
-        card_layout.addWidget(self.scroll, 1)
+        self.list_widget.setAutoFillBackground(False)
+        self.scroll.viewport().setAutoFillBackground(False)
+        cl.addWidget(self.scroll, 1)
 
         # ── Footer ──
-        card_layout.addWidget(Divider())
+        cl.addWidget(Divider())
         footer = QWidget()
-        footer.setFixedHeight(36)
-        footer.setStyleSheet(f"""
-            background: {P['surface']};
-            border-bottom-left-radius: 12px;
-            border-bottom-right-radius: 12px;
-        """)
-        f_lay = QHBoxLayout(footer)
-        f_lay.setContentsMargins(SP2 + 2, 0, SP2 + 2, 0)
-
-        self.foot_key = QLabel()
-        self.foot_key.setFont(mono_font(8))
-        self.foot_key.setStyleSheet(
-            f"color: {P['muted']}; background: transparent;")
+        footer.setFixedHeight(CONTROL_H)
+        fl = QHBoxLayout(footer)
+        fl.setContentsMargins(S4, 0, S4, 0)
+        self.foot_key   = Label("", "caption", "tertiary")
+        self.foot_count = Label("", "caption", "tertiary")
+        fl.addWidget(self.foot_key)
+        fl.addStretch()
+        fl.addWidget(self.foot_count)
+        cl.addWidget(footer)
         self._update_foot_key()
 
-        self.foot_count = QLabel()
-        self.foot_count.setFont(ui_font(8))
-        self.foot_count.setStyleSheet(
-            f"color: {P['muted']}; background: transparent;")
-
-        f_lay.addWidget(self.foot_key)
-        f_lay.addStretch()
-        f_lay.addWidget(self.foot_count)
-
-        card_layout.addWidget(footer)
-
     def _update_foot_key(self):
-        self.foot_key.setText(f"hotkey  {self.data.get('trigger_key', '?')}")
+        self.foot_key.setText(f"Hotkey: {self.data.get('trigger_key', '?')}")
 
     def _build_flat(self):
         self._flat = []
@@ -707,8 +1143,10 @@ class OverlayWindow(QWidget):
     def _render(self, query: str = ""):
         while self.list_layout.count() > 1:
             item = self.list_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+            w = item.widget()
+            if w:
+                w.hide()            # no ghost rows while deletion is pending
+                w.deleteLater()
         self._rows.clear()
         self._filtered_idx.clear()
 
@@ -719,34 +1157,35 @@ class OverlayWindow(QWidget):
             if not q or q in key.lower() or q in action.lower() or q in cat.lower()
         ]
 
+        # Key column is as wide as the widest badge, so actions line up
+        fm = QFontMetrics(role_font("key"))
+        key_w = max((fm.horizontalAdvance(k) for _, _, k, _ in filtered),
+                    default=0) + 2 * S2 + 2 + S1
+        key_w = max(S5 * 4, min(key_w, 240))
+
         current_cat = None
         for orig_i, cat, key, action in filtered:
             if cat != current_cat:
                 current_cat = cat
                 self.list_layout.insertWidget(
                     self.list_layout.count() - 1, CategoryHeader(cat))
-            row = ShortcutRow(key, action)
-            if q:
-                row.set_highlight(q)
+            row = ShortcutRow(key, action, key_w, q)
             self.list_layout.insertWidget(self.list_layout.count() - 1, row)
             self._rows.append(row)
             self._filtered_idx.append(orig_i)
 
         if not filtered:
             empty = QWidget()
-            empty.setStyleSheet("background: transparent;")
-            e_lay = QVBoxLayout(empty)
-            e_lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            t = QLabel("Nothing found")
-            t.setFont(ui_font(11))
-            t.setStyleSheet(f"color: {P['muted']}; background: transparent;")
+            el = QVBoxLayout(empty)
+            el.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            el.setContentsMargins(0, S5 * 2, 0, 0)
+            el.setSpacing(S1)
+            t = Label("No matching shortcuts", "body", "secondary")
             t.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            s = QLabel("Try a different search term")
-            s.setFont(ui_font(9))
-            s.setStyleSheet(f"color: {P['muted']}; background: transparent;")
+            s = Label("Try a different search term.", "caption", "tertiary")
             s.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            e_lay.addWidget(t)
-            e_lay.addWidget(s)
+            el.addWidget(t)
+            el.addWidget(s)
             self.list_layout.insertWidget(self.list_layout.count() - 1, empty)
 
         n, total = len(filtered), len(self._flat)
@@ -769,7 +1208,7 @@ class OverlayWindow(QWidget):
         self._rows[self._sel].set_selected(False)
         self._sel = (self._sel + delta) % len(self._rows)
         self._rows[self._sel].set_selected(True)
-        self.scroll.ensureWidgetVisible(self._rows[self._sel], 0, 60)
+        self.scroll.ensureWidgetVisible(self._rows[self._sel], 0, S5 * 2)
 
     def keyPressEvent(self, event):
         key = event.key()
@@ -786,37 +1225,28 @@ class OverlayWindow(QWidget):
             super().keyPressEvent(event)
 
     def show_overlay(self):
-        screen = QApplication.primaryScreen().availableGeometry()
-        w, h    = self.width(), self.height()
-        x       = screen.right() - w - 52
-        y_end   = screen.bottom() - h - 60
-        y_start = y_end + 20
-
         self.search_box.clear()
         self._build_flat()
         self._render()
-
-        self.setGeometry(x, y_start, w, h)
+        self._place()
         self.show()
         self.raise_()
         self.activateWindow()
         self._visible = True
-
-        self._anim.setStartValue(QRect(x, y_start, w, h))
-        self._anim.setEndValue(QRect(x, y_end, w, h))
-        self._anim.start()
-
         QTimer.singleShot(80, self.search_box.setFocus)
 
     def hide_overlay(self):
+        if not self._visible:
+            return
         self._visible = False
-        self._fade_out = QPropertyAnimation(self, b"windowOpacity")
-        self._fade_out.setDuration(120)
-        self._fade_out.setStartValue(1.0)
-        self._fade_out.setEndValue(0.0)
-        self._fade_out.setEasingCurve(QEasingCurve.Type.InCubic)
-        self._fade_out.finished.connect(lambda: (self.hide(), self.setWindowOpacity(1.0)))
-        self._fade_out.start()
+        self.hide()
+
+    def changeEvent(self, event):
+        if (event.type() == QEvent.Type.ActivationChange
+                and not self.isActiveWindow()
+                and self._visible):
+            self.hide_overlay()
+        super().changeEvent(event)
 
     def toggle(self):
         if self._visible:
@@ -831,118 +1261,7 @@ class OverlayWindow(QWidget):
         self._update_foot_key()
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Shortcut Dialog
-# ─────────────────────────────────────────────────────────────────────────────
-
-class ShortcutDialog(QDialog):
-    def __init__(self, parent, key="", action=""):
-        super().__init__(parent)
-        self.result_data = None
-        self.setWindowTitle("Shortcut")
-        self.setFixedWidth(420)
-        self.setWindowFlags(
-            Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
-        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
-        self.setStyleSheet(f"""
-            QDialog {{
-                background: {P['surface']};
-                border: 1px solid {P['border_hi']};
-                border-radius: 10px;
-            }}
-        """)
-
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(SP3, SP2 + 4, SP3, SP2 + 4)
-        lay.setSpacing(SP2)
-
-        title = QLabel("Edit Shortcut" if key else "New Shortcut")
-        title.setFont(ui_font(13, QFont.Weight.Bold))
-        title.setStyleSheet(f"color: {P['text']};")
-        lay.addWidget(title)
-        lay.addWidget(Divider())
-
-        def field(label_text, value):
-            w  = QWidget()
-            w.setStyleSheet("background: transparent;")
-            fl = QVBoxLayout(w)
-            fl.setContentsMargins(0, 0, 0, 0)
-            fl.setSpacing(5)
-            lbl = QLabel(label_text)
-            lbl.setFont(ui_font(8, QFont.Weight.Bold))
-            lbl.setStyleSheet(f"color: {P['muted']}; letter-spacing: 1px;")
-            inp = StyledInput()
-            inp.setText(value)
-            fl.addWidget(lbl)
-            fl.addWidget(inp)
-            lay.addWidget(w)
-            return inp
-
-        self.key_inp    = field("SHORTCUT KEY",       key)
-        self.action_inp = field("ACTION DESCRIPTION", action)
-        lay.addWidget(Divider())
-
-        btn_row = QWidget()
-        btn_row.setStyleSheet("background: transparent;")
-        b_lay = QHBoxLayout(btn_row)
-        b_lay.setContentsMargins(0, 0, 0, 0)
-        b_lay.addStretch()
-        cancel = GhostButton("Cancel")
-        cancel.clicked.connect(self.reject)
-        save = GhostButton("Save", accent=True)
-        save.clicked.connect(self._save)
-        b_lay.addWidget(cancel)
-        b_lay.addSpacing(SP)
-        b_lay.addWidget(save)
-        lay.addWidget(btn_row)
-
-    def _save(self):
-        k = self.key_inp.text().strip()
-        a = self.action_inp.text().strip()
-        if k and a:
-            self.result_data = {"key": k, "action": a}
-            self.accept()
-
-    def keyPressEvent(self, e):
-        if e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-            self._save()
-        elif e.key() == Qt.Key.Key_Escape:
-            self.reject()
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Animated top bar
-# ─────────────────────────────────────────────────────────────────────────────
-
-class AnimatedTopBar(QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setFixedHeight(2)
-        self._pos   = 0.0
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self._tick)
-        self._timer.start(16)
-
-    def _tick(self):
-        self._pos = (self._pos + 0.0018) % 1.0
-        self.update()
-
-    def paintEvent(self, _event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        w = self.width()
-        p.fillRect(0, 0, w, 2, QColor(P["border"]))
-        cx   = int(self._pos * (w + 300)) - 150
-        span = 220
-        grad = QLinearGradient(cx - span, 0, cx + span, 0)
-        grad.setColorAt(0.0,  QColor(0, 0, 0, 0))
-        grad.setColorAt(0.35, QColor(P["accent"]))
-        grad.setColorAt(0.5,  QColor(P["accent_hi"]))
-        grad.setColorAt(0.65, QColor(P["accent"]))
-        grad.setColorAt(1.0,  QColor(0, 0, 0, 0))
-        p.fillRect(cx - span, 0, span * 2, 2, grad)
-        p.end()
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Manager Window
+#  Manager window
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ManagerWindow(QMainWindow):
@@ -955,334 +1274,252 @@ class ManagerWindow(QMainWindow):
         self.setWindowTitle("OverCut")
         self.resize(960, 640)
         self.setMinimumSize(780, 520)
-        self.setStyleSheet(f"QMainWindow {{ background: {P['base']}; }}")
 
         self._build_ui()
         self.overlay = OverlayWindow(self.data)
         self._setup_tray()
         self._start_hotkey()
 
+    # ── Layout ────────────────────────────────────────────────────────────────
+
     def _build_ui(self):
         central = QWidget()
-        central.setStyleSheet(f"background: {P['base']};")
         self.setCentralWidget(central)
-
         root = QVBoxLayout(central)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        root.addWidget(AnimatedTopBar())
+        root.addWidget(self._build_header())
 
-        # ── Titlebar ──
-        titlebar = QWidget()
-        titlebar.setFixedHeight(76)
-        titlebar.setStyleSheet(f"""
-            background: {P['surface']};
-            border-bottom: 1px solid {P['base']};
-        """)
-        tb_lay = QHBoxLayout(titlebar)
-        tb_lay.setContentsMargins(SP3, 0, SP2 + 4, 0)
-        tb_lay.setSpacing(0)
-
-        title_block = QWidget()
-        title_block.setStyleSheet("background: transparent;")
-        tb_vlay = QVBoxLayout(title_block)
-        tb_vlay.setContentsMargins(0, 0, 0, 0)
-        tb_vlay.setSpacing(2)
-        title_lbl = QLabel("OVERCUT")
-        title_lbl.setStyleSheet(f"""
-            color: {P['text']};
-            background: transparent;
-            letter-spacing: 8px;
-            font-family: "Zalando Sans Expanded";
-            font-weight: 900;
-            font-size: 19pt;
-        """)
-        tb_vlay.addWidget(title_lbl)
-        tb_lay.addWidget(title_block)
-        tb_lay.addStretch()
-
-        hk_lbl = QLabel("HOTKEY")
-        hk_font = ui_font(7, QFont.Weight.Bold)
-        hk_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 2.5)
-        hk_lbl.setFont(condensed_font(7, QFont.Weight.Bold))
-        hk_lbl.setStyleSheet(f"""
-            color: {P['muted']};
-            background: transparent;
-            font-family: "Roboto Condensed";
-            font-weight: 700;
-            font-size: 7pt;
-        """)
-
-        self.hotkey_inp = QLineEdit(self.data.get("trigger_key", ""))
-        self.hotkey_inp.setFont(mono_font(10))
-        self.hotkey_inp.setFixedWidth(210)
-        self.hotkey_inp.setFixedHeight(34)
-        self.hotkey_inp.setStyleSheet(f"""
-            QLineEdit {{
-                background: {P['input']};
-                color: {P['accent_hi']};
-                border: 1px solid {P['border']};
-                border-radius: 6px;
-                padding: 0 12px;
-                selection-background-color: {P['accent_dim']};
-                font-family: "JetBrains Mono";
-                font-size: 10pt;
-            }}
-            QLineEdit:focus {{ border-color: {P['accent']}; }}
-        """)
-
-        apply_btn = GhostButton("Apply")
-        apply_btn.setFixedHeight(34)
-        apply_btn.clicked.connect(self._apply_hotkey)
-
-        tb_lay.addWidget(hk_lbl)
-        tb_lay.addSpacing(SP + 2)
-        tb_lay.addWidget(self.hotkey_inp)
-        tb_lay.addSpacing(SP)
-        tb_lay.addWidget(apply_btn)
-        root.addWidget(titlebar)
-
-        # ── Body ──
-        body = QWidget()
-        body.setStyleSheet(f"background: {P['base']};")
-        b_lay = QHBoxLayout(body)
-        b_lay.setContentsMargins(SP2 + 4, SP2 + 4, SP2 + 4, SP2 + 4)
-        b_lay.setSpacing(SP2)
-
-        # ─ Sidebar ─
-        sidebar = QWidget()
-        sidebar.setFixedWidth(210)
-        sidebar.setStyleSheet("background: transparent;")
-        sb_lay = QVBoxLayout(sidebar)
-        sb_lay.setContentsMargins(0, 0, 0, 0)
-        sb_lay.setSpacing(SP)
-
-        cat_lbl = QLabel("CATEGORIES")
-        cat_font = ui_font(7, QFont.Weight.Bold)
-        cat_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 2.0)
-        cat_lbl.setFont(condensed_font(7, QFont.Weight.Bold))
-        cat_lbl.setStyleSheet(f"""
-            color: {P['muted']};
-            background: transparent;
-            font-family: "Roboto Condensed";
-            font-weight: 700;
-            font-size: 7pt;
-        """)
-        sb_lay.addWidget(cat_lbl)
-
-        self.cat_list = QListWidget()
-        self.cat_list.setStyleSheet(f"""
-            QListWidget {{
-                background: {P['surface']};
-                border: 1px solid {P['border']};
-                border-radius: 10px;
-                outline: none;
-                padding: 4px 0;
-            }}
-            QListWidget::item {{
-                color: {P['text2']};
-                padding: 9px 14px;
-                border-left: 2px solid transparent;
-                font-size: 10pt;
-            }}
-            QListWidget::item:hover {{
-                background: {P['hover']};
-                color: {P['text']};
-            }}
-            QListWidget::item:selected {{
-                background: {P['active']};
-                color: {P['text']};
-                border-left: 2px solid {P['accent']};
-            }}
-        """)
-        self.cat_list.currentRowChanged.connect(self._on_cat_change)
-        sb_lay.addWidget(self.cat_list, 1)
-
-        cb = QWidget()
-        cb.setStyleSheet("background: transparent;")
-        cb_lay = QVBoxLayout(cb)
-        cb_lay.setContentsMargins(0, 0, 0, 0)
-        cb_lay.setSpacing(6)
-        add_cat_btn = GhostButton("New Category")
-        add_cat_btn.clicked.connect(self._add_category)
-        del_cat_btn = GhostButton("Delete Category")
-        del_cat_btn.clicked.connect(self._del_category)
-        cb_lay.addWidget(add_cat_btn)
-        cb_lay.addWidget(del_cat_btn)
-        sb_lay.addWidget(cb)
-        b_lay.addWidget(sidebar)
-
-        # ─ Main panel ─
-        main_panel = QWidget()
-        main_panel.setStyleSheet("background: transparent;")
-        mp_lay = QVBoxLayout(main_panel)
-        mp_lay.setContentsMargins(0, 0, 0, 0)
-        mp_lay.setSpacing(SP)
-
-        sc_lbl = QLabel("SHORTCUTS")
-        sc_font = ui_font(7, QFont.Weight.Bold)
-        sc_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 2.0)
-        sc_lbl.setFont(condensed_font(7, QFont.Weight.Bold))    
-        sc_lbl.setStyleSheet(f"""
-            color: {P['muted']};
-            background: transparent;
-            font-family: "Roboto Condensed";
-            font-weight: 700;
-            font-size: 7pt;
-        """)
-        mp_lay.addWidget(sc_lbl)
-
-        tree_container = QWidget()
-        tree_container.setStyleSheet(f"""
-            background: {P['surface']};
-            border: 1px solid {P['border']};
-            border-radius: 10px;
-        """)
-        tc_lay = QVBoxLayout(tree_container)
-        tc_lay.setContentsMargins(0, 0, 0, 0)
-        tc_lay.setSpacing(0)
-
-        self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["Shortcut Key", "Action"])
-        self.tree.setColumnWidth(0, 190)
-        self.tree.setRootIsDecorated(False)
-        self.tree.setAlternatingRowColors(False)
-        self.tree.setSelectionMode(QTreeWidget.SelectionMode.SingleSelection)
-        self.tree.setVerticalScrollMode(QTreeWidget.ScrollMode.ScrollPerPixel)
-        self.tree.setStyleSheet(f"""
-            QTreeWidget {{
-                background: transparent;
-                border: none;
-                outline: none;
-                font-size: 10pt;
-                color: {P['text2']};
-            }}
-            QTreeWidget::item {{
-                padding: 8px 10px;
-                border-bottom: 1px solid {P['border']};
-            }}
-            QTreeWidget::item:hover {{
-                background: {P['hover']};
-                color: {P['text']};
-            }}
-            QTreeWidget::item:selected {{
-                background: {P['accent_dim']};
-                color: {P['text']};
-                border-bottom: 1px solid {P['border']};
-            }}
-            QHeaderView::section {{
-                background: {P['raised']};
-                color: {P['muted']};
-                border: none;
-                border-bottom: 1px solid {P['border']};
-                border-right: 1px solid {P['border']};
-                padding: 6px 10px;
-                font-size: 8pt;
-                font-weight: bold;
-                letter-spacing: 1px;
-            }}
-        """)
-        tc_lay.addWidget(self.tree, 1)
-
-        act_bar = QWidget()
-        act_bar.setFixedHeight(54)
-        act_bar.setStyleSheet(f"""
-            background: {P['raised']};
-            border-top: 1px solid {P['border']};
-            border-bottom-left-radius: 10px;
-            border-bottom-right-radius: 10px;
-        """)
-        ab_lay = QHBoxLayout(act_bar)
-        ab_lay.setContentsMargins(SP + 6, 0, SP + 6, 0)
-        ab_lay.setSpacing(SP)
-
-        btn_font = ui_font(9, QFont.Weight.Medium)
-        add_btn  = GhostButton("Add Shortcut", accent=True)
-        edit_btn = GhostButton("Edit")
-        del_btn  = GhostButton("Delete")
-        stop_btn = GhostButton("Stop Service")
-        stop_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: transparent;
-                color: {P['red']};
-                border: 1px solid {P['border']};
-                border-radius: 6px;
-                padding: 7px 14px;
-                font-size: 9pt;
-            }}
-            QPushButton:hover {{
-                background: {P['red']}18;
-                border-color: {P['red']};
-            }}
-            QPushButton:pressed {{ background: {P['red']}30; }}
-        """)
-        stop_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-
-        for b in (add_btn, edit_btn, del_btn, stop_btn):
-            b.setFont(btn_font)
-
-        add_btn.clicked.connect(self._add_shortcut)
-        edit_btn.clicked.connect(self._edit_shortcut)
-        del_btn.clicked.connect(self._del_shortcut)
-        stop_btn.clicked.connect(self._quit)
-
-        ab_lay.addWidget(add_btn)
-        ab_lay.addWidget(edit_btn)
-        ab_lay.addWidget(del_btn)
-        ab_lay.addSpacing(SP + 4)
-        ab_lay.addWidget(stop_btn)
-        ab_lay.addStretch()
-
-        tc_lay.addWidget(act_bar)
-        mp_lay.addWidget(tree_container, 1)
-        b_lay.addWidget(main_panel, 1)
-        root.addWidget(body, 1)
+        self.pages = QStackedWidget()
+        self.pages.addWidget(self._build_main_page())       # 0
+        self.pages.addWidget(self._build_settings_page())   # 1
+        root.addWidget(self.pages, 1)
 
         self._refresh_cats()
 
-    def _refresh_cats(self):
+    def _build_header(self) -> QWidget:
+        bar = QFrame()
+        bar.setObjectName("BarBottom")
+        bar.setFixedHeight(S5 * 2)                          # 48
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(S4, 0, S4, 0)
+        lay.setSpacing(S2)
+
+        lay.addWidget(Label("OverCut", "title"))
+        lay.addStretch()
+        lay.addWidget(Label("Overlay hotkey", "caption", "secondary"))
+
+        self.hotkey_inp = AppLineEdit(self.data.get("trigger_key", ""))
+        self.hotkey_inp.setFont(role_font("mono"))
+        self.hotkey_inp.setFixedWidth(200)
+
+        apply_btn = AppButton("Apply")
+        apply_btn.clicked.connect(self._apply_hotkey)
+        settings_btn = AppButton("Settings")
+        settings_btn.clicked.connect(self._open_settings)
+
+        lay.addWidget(self.hotkey_inp)
+        lay.addWidget(apply_btn)
+        lay.addSpacing(S2)
+        lay.addWidget(settings_btn)
+        return bar
+
+    def _build_main_page(self) -> QWidget:
+        page = QWidget()
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        content = QWidget()
+        cl = QHBoxLayout(content)
+        cl.setContentsMargins(S4, S4, S4, S4)
+        cl.setSpacing(S4)
+        cl.addWidget(self._build_sidebar())
+        cl.addWidget(self._build_table_panel(), 1)
+        outer.addWidget(content, 1)
+
+        outer.addWidget(self._build_footer())
+        return page
+
+    def _build_sidebar(self) -> QWidget:
+        side = QWidget()
+        side.setFixedWidth(200)
+        lay = QVBoxLayout(side)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(S2)
+
+        head = QWidget()
+        head.setFixedHeight(CONTROL_H)
+        hl = QHBoxLayout(head)
+        hl.setContentsMargins(0, 0, 0, 0)
+        hl.addWidget(SectionHeader("Categories"))
+        lay.addWidget(head)
+
+        card = AppCard()
+        cl = QVBoxLayout(card)
+        cl.setContentsMargins(0, 0, 0, 0)
+        self.cat_list = QListWidget()
+        self.cat_list.setObjectName("Sidebar")
+        self.cat_list.setFont(role_font("body"))
+        self.cat_list.setFrameShape(QFrame.Shape.NoFrame)
+        self.cat_list.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.cat_list.currentRowChanged.connect(self._on_cat_change)
+        cl.addWidget(self.cat_list)
+        lay.addWidget(card, 1)
+
+        row = QHBoxLayout()
+        row.setSpacing(S2)
+        add_btn = AppButton("New")
+        add_btn.clicked.connect(self._add_category)
+        self.del_cat_btn = AppButton("Delete")
+        self.del_cat_btn.clicked.connect(self._del_category)
+        row.addWidget(add_btn, 1)
+        row.addWidget(self.del_cat_btn, 1)
+        lay.addLayout(row)
+        return side
+
+    def _build_table_panel(self) -> QWidget:
+        panel = QWidget()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(S2)
+
+        head = QWidget()
+        head.setFixedHeight(CONTROL_H)
+        hl = QHBoxLayout(head)
+        hl.setContentsMargins(0, 0, 0, 0)
+        hl.setSpacing(S2)
+        self.cat_title = Label("", "title")
+        self.cat_count = Label("", "caption", "tertiary")
+        hl.addWidget(self.cat_title)
+        hl.addWidget(self.cat_count)
+        hl.addStretch()
+        lay.addWidget(head)
+
+        card = AppCard()
+        self.table_stack = QStackedLayout(card)
+        self.table_stack.setContentsMargins(0, 0, 0, 0)
+
+        self.tree = QTreeWidget()
+        self.tree.setObjectName("Table")
+        self.tree.setFont(role_font("body"))
+        self.tree.setHeaderLabels(["Shortcut", "Action"])
+        self.tree.setFrameShape(QFrame.Shape.NoFrame)
+        self.tree.setRootIsDecorated(False)
+        self.tree.setIndentation(0)
+        self.tree.setUniformRowHeights(True)
+        self.tree.setColumnWidth(0, 200)
+        self.tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.tree.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.tree.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        hdr = self.tree.header()
+        hdr.setFixedHeight(CONTROL_H)
+        hdr.setFont(role_font("caption_strong"))
+        hdr.setStretchLastSection(True)
+        hdr.setSectionsMovable(False)
+        hdr.setHighlightSections(False)
+        self.tree.itemSelectionChanged.connect(self._sync_buttons)
+        self.table_stack.addWidget(self.tree)
+
+        empty = QWidget()
+        el = QVBoxLayout(empty)
+        el.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        el.setSpacing(S1)
+        self.empty_title = Label("", "body", "secondary")
+        self.empty_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_hint = Label("", "caption", "tertiary")
+        self.empty_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        el.addWidget(self.empty_title)
+        el.addWidget(self.empty_hint)
+        self.table_stack.addWidget(empty)
+        lay.addWidget(card, 1)
+
+        row = QHBoxLayout()
+        row.setSpacing(S2)
+        self.add_btn  = AppButton("Add shortcut", "primary")
+        self.edit_btn = AppButton("Edit")
+        self.del_btn  = AppButton("Delete")
+        self.add_btn.clicked.connect(self._add_shortcut)
+        self.edit_btn.clicked.connect(self._edit_shortcut)
+        self.del_btn.clicked.connect(self._del_shortcut)
+        row.addWidget(self.add_btn)
+        row.addWidget(self.edit_btn)
+        row.addWidget(self.del_btn)
+        row.addStretch()
+        lay.addLayout(row)
+        return panel
+
+    def _build_footer(self) -> QWidget:
+        bar = QFrame()
+        bar.setObjectName("BarTop")
+        bar.setFixedHeight(S5 * 2)
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(S4, 0, S4, 0)
+        lay.addWidget(Label(
+            "Closing this window keeps OverCut running in the system tray.",
+            "caption", "tertiary"))
+        lay.addStretch()
+        quit_btn = AppButton("Quit OverCut", "danger")
+        quit_btn.clicked.connect(self._quit)
+        lay.addWidget(quit_btn)
+        return bar
+
+    # ── Categories / shortcuts ────────────────────────────────────────────────
+
+    def _refresh_cats(self, select: str | None = None):
         self.cat_list.clear()
         for cat in self.data["categories"]:
-            self.cat_list.addItem(cat)
+            item = QListWidgetItem(cat)
+            item.setSizeHint(QSize(0, CONTROL_H))
+            self.cat_list.addItem(item)
         if self.cat_list.count():
-            self.cat_list.setCurrentRow(0)
+            row = 0
+            if select in self.data["categories"]:
+                row = list(self.data["categories"]).index(select)
+            self.cat_list.setCurrentRow(row)
+        else:
+            self._load_shortcuts(None)
 
     def _current_cat(self):
         item = self.cat_list.currentItem()
         return item.text() if item else None
 
     def _on_cat_change(self, _=None):
-        cat = self._current_cat()
-        if cat:
-            self._load_shortcuts(cat)
+        self._load_shortcuts(self._current_cat())
+
+    def _sync_buttons(self):
+        has_cat = self._current_cat() is not None
+        has_row = self.tree.currentItem() is not None
+        self.add_btn.setEnabled(has_cat)
+        self.edit_btn.setEnabled(has_row)
+        self.del_btn.setEnabled(has_row)
+        self.del_cat_btn.setEnabled(has_cat)
 
     def _add_category(self):
-        dlg = _InputDialog(self, "New Category", "Category name:")
+        dlg = InputDialog(self, "New category", "Category name")
         if dlg.exec() and dlg.value.strip():
             name = dlg.value.strip()
             if name in self.data["categories"]:
-                QMessageBox.warning(self, "Exists", f'"{name}" already exists.')
+                MessageDialog(self, "Category exists",
+                              f'"{name}" already exists.').exec()
                 return
             self.data["categories"][name] = []
             save_data(self.data)
-            self._refresh_cats()
+            self._refresh_cats(select=name)
             self.overlay.refresh(self.data)
 
     def _del_category(self):
         cat = self._current_cat()
         if not cat:
             return
-        mb = QMessageBox(self)
-        mb.setWindowTitle("Delete")
-        mb.setText(f'Delete "{cat}" and all its shortcuts?')
-        mb.setStandardButtons(
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel)
-        mb.setStyleSheet(f"""
-            QMessageBox {{ background: {P['surface']}; }}
-            QLabel {{ color: {P['text']}; }}
-        """)
-        if mb.exec() == QMessageBox.StandardButton.Yes:
+        dlg = MessageDialog(
+            self, "Delete category",
+            f'Delete "{cat}" and all its shortcuts?',
+            "Delete", danger=True, cancel_text="Cancel")
+        if dlg.exec():
             del self.data["categories"][cat]
             save_data(self.data)
             self._refresh_cats()
@@ -1290,9 +1527,31 @@ class ManagerWindow(QMainWindow):
 
     def _load_shortcuts(self, cat):
         self.tree.clear()
-        for s in self.data["categories"].get(cat, []):
+        if cat is None:
+            self.cat_title.setText("No category")
+            self.cat_count.setText("")
+            self.empty_title.setText("No categories yet")
+            self.empty_hint.setText("Use New to create your first category.")
+            self.table_stack.setCurrentIndex(1)
+            self._sync_buttons()
+            return
+
+        items = self.data["categories"].get(cat, [])
+        mono = role_font("mono")
+        for s in items:
             item = QTreeWidgetItem([s["key"], s["action"]])
+            item.setFont(0, mono)
+            item.setSizeHint(0, QSize(0, CONTROL_H))
+            item.setSizeHint(1, QSize(0, CONTROL_H))
             self.tree.addTopLevelItem(item)
+
+        n = len(items)
+        self.cat_title.setText(cat)
+        self.cat_count.setText(f"{n} shortcut{'s' if n != 1 else ''}")
+        self.empty_title.setText("No shortcuts in this category")
+        self.empty_hint.setText("Use Add shortcut to create one.")
+        self.table_stack.setCurrentIndex(0 if n else 1)
+        self._sync_buttons()
 
     def _add_shortcut(self):
         cat = self._current_cat()
@@ -1330,6 +1589,80 @@ class ManagerWindow(QMainWindow):
         self._load_shortcuts(cat)
         self.overlay.refresh(self.data)
 
+    # ── Settings ──────────────────────────────────────────────────────────────
+
+    def _open_settings(self):
+        self.pages.setCurrentIndex(1)
+
+    def _show_main(self):
+        self.pages.setCurrentIndex(0)
+
+    def _build_settings_page(self) -> QWidget:
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(S4, S4, S4, S4)
+        lay.setSpacing(S4)
+
+        head = QHBoxLayout()
+        head.setSpacing(S3)
+        back_btn = AppButton("Back")
+        back_btn.clicked.connect(self._show_main)
+        changelog_btn = AppButton("Changelog")
+        changelog_btn.clicked.connect(lambda: ChangelogDialog(self).exec())
+        head.addWidget(back_btn)
+        head.addWidget(Label("Settings", "title"))
+        head.addStretch()
+        head.addWidget(changelog_btn)
+        lay.addLayout(head)
+
+        card = AppCard()
+        card.setFixedWidth(640)
+        cl = QVBoxLayout(card)
+        cl.setContentsMargins(0, 0, 0, 0)
+        cl.setSpacing(0)
+
+        startup = Switch(_get_startup_enabled())
+        startup.toggled.connect(_set_startup)
+        cl.addWidget(self._setting_row(
+            "Launch at startup",
+            "Start OverCut automatically when Windows boots.",
+            startup))
+        cl.addWidget(Divider())
+
+        theme = Segmented(["Dark", "Light"],
+                          "Light" if CURRENT_THEME == "light" else "Dark")
+        theme.changed.connect(lambda t: self._apply_theme(t == "Light"))
+        cl.addWidget(self._setting_row(
+            "Theme", "Applies after restarting OverCut.", theme))
+
+        lay.addWidget(card, 0, Qt.AlignmentFlag.AlignLeft)
+        lay.addStretch()
+        return page
+
+    def _setting_row(self, title: str, subtitle: str, control: QWidget) -> QWidget:
+        row = QWidget()
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(S4, S3, S4, S3)
+        rl.setSpacing(S4)
+
+        text = QVBoxLayout()
+        text.setSpacing(S1)
+        text.addWidget(Label(title, "body"))
+        text.addWidget(Label(subtitle, "caption", "tertiary"))
+        rl.addLayout(text, 1)
+        rl.addWidget(control, 0, Qt.AlignmentFlag.AlignVCenter)
+        return row
+
+    def _apply_theme(self, light: bool):
+        """Save theme preference. The user restarts manually to apply."""
+        self.data["theme"] = "light" if light else "dark"
+        save_data(self.data)
+        self.tray.showMessage(
+            "OverCut", "Theme saved. Restart OverCut to apply.",
+            QSystemTrayIcon.MessageIcon.Information, 3000)
+
+    # ── Hotkey ────────────────────────────────────────────────────────────────
+
     def _apply_hotkey(self):
         k = self.hotkey_inp.text().strip()
         if not k:
@@ -1353,36 +1686,45 @@ class ManagerWindow(QMainWindow):
             self._hotkey_thread.stop()
             self._hotkey_thread = None
 
-    def _setup_tray(self):
-        px = QPixmap(16, 16)
-        px.fill(QColor(0, 0, 0, 0))
-        p = QPainter(px)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.setBrush(QBrush(QColor(P["accent"])))
-        p.setPen(Qt.PenStyle.NoPen)
-        p.drawRoundedRect(0, 0, 16, 16, 3, 3)
-        p.setPen(QPen(QColor("#ffffff")))
-        p.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
-        p.drawText(px.rect(), Qt.AlignmentFlag.AlignCenter, "K")
-        p.end()
+    # ── Tray ──────────────────────────────────────────────────────────────────
 
-        self.tray = QSystemTrayIcon(QIcon(px), self)
-        menu = QMenu()
-        menu.setStyleSheet(f"""
-            QMenu {{
-                background: {P['surface']};
-                border: 1px solid {P['border_hi']};
-                border-radius: 8px;
-                padding: 4px;
-                color: {P['text']};
-                font-size: 10pt;
-            }}
-            QMenu::item {{ padding: 7px 20px; border-radius: 4px; }}
-            QMenu::item:selected {{ background: {P['hover']}; }}
-            QMenu::separator {{ height: 1px; background: {P['border']}; margin: 4px 0; }}
-        """)
-        menu.addAction("Show Manager",   self.show)
-        menu.addAction("Toggle Overlay", self.overlay.toggle)
+    def _setup_tray(self):
+        # overcut.ico: check _MEIPASS (bundled), then exe dir, then script dir
+        icon = None
+        for base in (
+            getattr(sys, "_MEIPASS", None),
+            os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else None,
+            os.path.dirname(os.path.abspath(__file__)),
+            os.getcwd(),
+        ):
+            if base is None:
+                continue
+            ico = os.path.join(base, "overcut.ico")
+            if os.path.exists(ico):
+                icon = QIcon(ico)
+                print(f"[Tray] Loaded icon from: {ico}")
+                break
+
+        if icon is None or icon.isNull():
+            print("[Tray] overcut.ico not found, using fallback painted icon")
+            px = QPixmap(16, 16)
+            px.fill(QColor(0, 0, 0, 0))
+            p = QPainter(px)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            p.setBrush(QBrush(QColor(P["accent"])))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.drawRoundedRect(0, 0, 16, 16, RADIUS_CONTROL, RADIUS_CONTROL)
+            p.setPen(QPen(QColor(P["on_accent"])))
+            f = role_font("caption_strong")
+            p.setFont(f)
+            p.drawText(px.rect(), Qt.AlignmentFlag.AlignCenter, "O")
+            p.end()
+            icon = QIcon(px)
+
+        self.tray = QSystemTrayIcon(icon, self)
+        menu = QMenu()                      # styled by the global stylesheet
+        menu.addAction("Show manager",   self.show)
+        menu.addAction("Toggle overlay", self.overlay.toggle)
         menu.addSeparator()
         menu.addAction("Quit", self._quit)
 
@@ -1410,86 +1752,46 @@ class ManagerWindow(QMainWindow):
         QApplication.quit()
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Input dialog
-# ─────────────────────────────────────────────────────────────────────────────
-
-class _InputDialog(QDialog):
-    def __init__(self, parent, title, prompt):
-        super().__init__(parent)
-        self.value = ""
-        self.setWindowTitle(title)
-        self.setFixedWidth(340)
-        self.setWindowFlags(
-            Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
-        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
-        self.setStyleSheet(f"""
-            QDialog {{
-                background: {P['surface']};
-                border: 1px solid {P['border_hi']};
-                border-radius: 10px;
-            }}
-        """)
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(SP2 + 4, SP2 + 2, SP2 + 4, SP2 + 2)
-        lay.setSpacing(SP + 4)
-
-        lbl = QLabel(prompt)
-        lbl.setFont(ui_font(10))
-        lbl.setStyleSheet(f"color: {P['text']};")
-        lay.addWidget(lbl)
-
-        self.inp = StyledInput()
-        lay.addWidget(self.inp)
-
-        btns = QWidget()
-        btns.setStyleSheet("background: transparent;")
-        b = QHBoxLayout(btns)
-        b.setContentsMargins(0, 0, 0, 0)
-        b.addStretch()
-        cancel = GhostButton("Cancel")
-        cancel.clicked.connect(self.reject)
-        ok = GhostButton("OK", accent=True)
-        ok.clicked.connect(self._ok)
-        b.addWidget(cancel)
-        b.addSpacing(SP)
-        b.addWidget(ok)
-        lay.addWidget(btns)
-
-    def _ok(self):
-        self.value = self.inp.text()
-        self.accept()
-
-    def keyPressEvent(self, e):
-        if e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-            self._ok()
-        elif e.key() == Qt.Key.Key_Escape:
-            self.reject()
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Entry point — ORDER IS CRITICAL
-#  1. QApplication
-#  2. _load_bundled_fonts()  <- MUST be here, after app, before any widget
-#  3. setStyleSheet
-#  4. Create windows
+#  Entry point. ORDER IS CRITICAL:
+#  1. platform options  2. QApplication  3. fonts  4. style/palette/QSS
+#  5. windows
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    # Qt 6 already opts into Per-Monitor V2 DPI awareness. Do not call
+    # SetProcessDpiAwareness yourself: forcing an older mode makes Qt's own
+    # call fail and gives worse scaling.
+    #
+    # FreeType font engine: smoother glyphs than the default Windows engine,
+    # and it supports variable fonts. Must be set BEFORE QApplication exists.
+    os.environ.setdefault("QT_QPA_PLATFORM", "windows:fontengine=freetype")
+
     app = QApplication(sys.argv)
     app.setApplicationName("OverCut")
     app.setQuitOnLastWindowClosed(False)
 
-    # Step 2 — load fonts before any widget touches QFont
+    for _base in (
+        getattr(sys, "_MEIPASS", None),
+        os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else None,
+        os.path.dirname(os.path.abspath(__file__)),
+        os.getcwd(),
+    ):
+        if _base and os.path.exists(os.path.join(_base, "overcut.ico")):
+            app.setWindowIcon(QIcon(os.path.join(_base, "overcut.ico")))
+            break
+
     _LOADED_FAMILIES.extend(_load_bundled_fonts())
     print(f"[Fonts] Resolved UI font   : {_best_family(_UI_CANDIDATES)}")
     print(f"[Fonts] Resolved mono font : {_best_family(_MONO_CANDIDATES)}")
 
-    # Step 3 — stylesheet after fonts are registered
-    app.setStyleSheet(QSS_GLOBAL)
+    app.setStyle("Fusion")              # consistent base that respects the palette
+    app.setFont(role_font("body"))
+    app.setPalette(build_palette())
+    app.setStyleSheet(build_qss())
 
     if not HOTKEY_OK:
-        print("Warning: 'keyboard' not installed — hotkey disabled.")
+        print("Warning: 'keyboard' not installed, hotkey disabled.")
 
-    # Step 4 — windows
     win = ManagerWindow()
     win.show()
     sys.exit(app.exec())

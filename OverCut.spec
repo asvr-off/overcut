@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('fonts', 'fonts')]
+datas = [('fonts', 'fonts'), ('overcut.ico', '.'), ('CHANGELOG.md', '.')]
 binaries = []
 hiddenimports = []
 tmp_ret = collect_all('PyQt6')
